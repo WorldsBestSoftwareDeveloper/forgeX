@@ -170,15 +170,62 @@ Run the schema in:
 supabase-schema.sql
 ```
 
-## Demo Mode vs Real Mode
+## Execution Modes
 
-Forge supports fallback modes so the app remains usable during demos.
+Forge supports both real execution and fallback modes for reliability during development and demos.
 
-- **Simulated payments** skip real MagicBlock transfers.
-- **Simulated inference** uses placeholder images instead of Replicate or Together.
-- **Supabase disabled** falls back to browser localStorage for basic agent state.
+Real Mode (Recommended)
 
-For the full flow, use Phantom on devnet, fund the wallet with devnet SOL/USDC, configure Supabase, and disable payment simulation.
+In real mode, Forge uses:
+
+real Phantom wallet authentication
+
+real treasury wallet generation
+
+real autonomous treasury execution
+
+real MagicBlock private payment flows
+
+real Solana devnet transactions
+
+real Replicate/Together inference (when configured)
+
+real Supabase persistence
+
+real Zerion-powered treasury rebalance execution (when enabled)
+
+
+For the full experience:
+
+connect Phantom on Solana devnet
+
+fund the treasury wallet with devnet SOL and/or USDC
+
+configure Supabase and provider API keys
+
+disable simulation flags
+
+
+Fallback / Demo Mode
+
+Fallback modes exist to keep the application operational if external services are unavailable during development, testing, or demos.
+
+Optional simulation flags include:
+
+Simulated inference — uses placeholder outputs when AI providers are unavailable
+
+Local persistence mode — falls back to browser localStorage if Supabase is not configured
+
+Mock provider mode — allows provider discovery and UI testing without external compute providers
+
+
+Important:
+
+autonomous treasury execution and MagicBlock payment infrastructure remain fully supported in real mode
+
+simulation modes are optional development safeguards, not the primary architecture
+
+failed real executions no longer silently succeed; errors surface directly in the UI with explicit failure states
 
 ## Notes
 

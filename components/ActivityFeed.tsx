@@ -28,9 +28,12 @@ interface Props {
 
 export function ActivityFeed({ steps, isRunning, waitingForWallet, walletAction }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
+  const feedRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = feedRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [steps.length, waitingForWallet])
 
   if (steps.length === 0) {
@@ -51,11 +54,19 @@ export function ActivityFeed({ steps, isRunning, waitingForWallet, walletAction 
     byPhase[p]!.push(s)
   }
 
-  // Which phases have at least started
-  const activePhases = PHASE_ORDER.filter(p => byPhase[p]?.length)
-
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+    <div
+      ref={feedRef}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 14,
+        maxHeight: 'min(68vh, 760px)',
+        overflowY: 'auto',
+        paddingRight: 4,
+        overscrollBehavior: 'contain',
+      }}
+    >
 
       {/* Pipeline overview bar */}
       <div style={{

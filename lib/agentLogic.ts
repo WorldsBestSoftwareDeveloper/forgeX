@@ -45,19 +45,19 @@ export function buildAgentSteps(provider: Provider, cost: number): AgentStep[] {
     // ── PHASE 2: Ephemeral Execution Environment ──────────────────────────────
     {
       id: 'er-create', phase: 'ephemeral', icon: 'lock', color: '#A78BFA',
-      label: 'Private Ephemeral Rollup environment created',
-      detail: 'MagicBlock TEE spun up · isolated execution context · challenge signed',
+      label: 'Initializing MagicBlock Private Ephemeral Rollup',
+      detail: 'Confidential execution environment active inside MagicBlock TEE',
     },
     {
       id: 'er-auth', phase: 'ephemeral', icon: 'shield', color: '#A78BFA',
-      label: 'TEE auth token obtained from MagicBlock',
-      detail: 'Phantom signed challenge · ER session active · payment channel open',
+      label: 'Secure enclave established',
+      detail: 'TEE authorization active; private provider commerce channel open',
     },
     // Payment gate — feed pauses here until Phantom approves
     {
       id: 'er-payment', phase: 'ephemeral', icon: 'zap', color: '#A78BFA',
-      label: `Micropayment processed — ${costStr} USDC`,
-      detail: 'visibility: private · amount + counterparty encrypted in TEE',
+      label: `Private settlement processing - ${costStr} USDC`,
+      detail: 'MagicBlock visibility: private; amount and counterparty encrypted',
     },
     {
       id: 'er-execute', phase: 'ephemeral', icon: 'cpu', color: '#FBBF24',
@@ -78,14 +78,14 @@ export function buildAgentSteps(provider: Provider, cost: number): AgentStep[] {
     },
     {
       id: 'settle-compress', phase: 'settlement', icon: 'shield', color: '#F59E0B',
-      label: 'Compressing settlement data',
-      detail: 'ZK state proof generated · on-chain footprint reduced ~95%',
+      label: 'Compressing confidential state',
+      detail: 'Private execution metadata hidden before Solana settlement',
     },
 
     // ── PHASE 4: Final Settlement to Solana ──────────────────────────────────
     {
       id: 'solana-submit', phase: 'solana', icon: 'chain', color: '#34D399',
-      label: 'Compressed settlement posted to Solana devnet',
+      label: 'Posting compressed settlement to Solana devnet',
       detail: 'Single settlement tx · all individual amounts remain private on-chain',
     },
     {

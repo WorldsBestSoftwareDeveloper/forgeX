@@ -1,8 +1,15 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useParams, useRouter }         from 'next/navigation'
 import { useWallet }                    from '@solana/wallet-adapter-react'
+import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from '@solana/web3.js'
+import {
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+  getAccount,
+  getAssociatedTokenAddress,
+} from '@solana/spl-token'
 import { motion, AnimatePresence }      from 'framer-motion'
 import { Navbar }                       from '@/components/Navbar'
 import { Sidebar }                      from '@/components/Sidebar'
@@ -10,13 +17,28 @@ import { ActivityFeed }                 from '@/components/ActivityFeed'
 import { PaymentModal }                 from '@/components/PaymentModal'
 import { ZKReceipt }                    from '@/components/ZKReceipt'
 import { SignInBanner }                 from '@/components/SignInBanner'
+import { TreasuryIntelligencePanel }     from '@/components/TreasuryIntelligencePanel'
 import { useAuthContext }               from '@/lib/AuthContext'
-import { Agent, loadAgents, saveAgents, saveTransaction } from '@/lib/store'
+import { Agent, loadAgents, saveAgents, saveTransaction, loadTreasuryActions, saveTreasuryAction, StoredTreasuryAction } from '@/lib/store'
 import { buildAgentSteps, AgentStep, STEP_DELAYS } from '@/lib/agentLogic'
 import { createERSession }              from '@/lib/ephemeralRollup'
+import { buildDefaultPolicy, buildRebalanceSimulation, createLocalTreasuryAction, createTreasurySnapshot } from '@/lib/zerionTreasury'
+import { getSolBalance, getUsdcBalance } from '@/lib/payment'
+import { SOLANA_RPC, USDC_MINT }          from '@/lib/config'
+import type { AutonomyPolicy }           from '@/lib/treasuryTypes'
 import type { ParsedIntent }            from '@/app/api/agent/intent/route'
 import type { Provider }                from '@/app/api/agent/providers/route'
 import type { RunResult }               from '@/app/api/agent/run/route'
+import type { AutonomySessionResponse }  from '@/app/api/treasury/session/route'
+import type { RebalanceResponse }        from '@/app/api/treasury/rebalance/route'
+import type { PauseAutonomyResponse }     from '@/app/api/treasury/pause/route'
+import type { TreasuryPaymentResponse }    from '@/app/api/agent/treasury-payment/route'
+import type { EnsureTreasuryResponse }      from '@/app/api/treasury/ensure/route'
+import type { ZerionMainnetWalletResponse } from '@/app/api/zerion/mainnet-wallet/route'
+import type { ZerionProofSwapResponse }     from '@/app/api/zerion/proof-swap/route'
+import type { AgentListItem }             from '@/app/api/agents/route'
+import type { TreasuryActionItem }        from '@/app/api/treasury/actions/route'
+import { apiAgentToStoreAgent }           from '@/lib/agentMapper'
 
 // ─── MagicBlock helpers imported from lib/magicblock.ts ─────────────────────
 import { executeMagicBlockTransfer, ensureUsdcAta } from '@/lib/magicblock'
@@ -60,6 +82,61 @@ const STATUS_LABELS: Record<RunStatus, string> = {
   executing:        'Running inference…',
   done:             'Complete',
   error:            'Error',
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+function buildAutonomyMessage(p: {
+  wallet: string
+  agentId: string
+  treasuryWallet: string
+  spendLimitUsdc: number
+  expiresAt: string
+}): string {
+  return [
+    'Authorize Forge autonomous agent',
+    '',
+    `Wallet: ${p.wallet}`,
+    `Agent ID: ${p.agentId}`,
+    `Treasury Wallet: ${p.treasuryWallet}`,
+    'Chain: solana-devnet',
+    `Spend Limit USDC: ${p.spendLimitUsdc.toFixed(6)}`,
+    'Allowed Tokens: SOL,USDC',
+    'Allowed Actions: gas-rebalance,provider-payment,policy-check,simulation',
+    `Expires At: ${p.expiresAt}`,
+    '',
+    'This signature authorizes policy-limited autonomous execution.',
+    'It is not a transaction and does not spend funds by itself.',
+  ].join('\n')
+}
+
+function buildZerionProofMessage(p: {
+  wallet: string
+  agentId: string
+  executionWallet: string
+  spendLimitUsdc: number
+  expiresAt: string
+}): string {
+  return [
+    'Authorize Forge Zerion mainnet proof',
+    '',
+    `Wallet: ${p.wallet}`,
+    `Agent ID: ${p.agentId}`,
+    `Execution Wallet: ${p.executionWallet}`,
+    'Chain: solana-mainnet',
+    `Spend Limit USDC: ${p.spendLimitUsdc.toFixed(6)}`,
+    'Allowed Tokens: SOL,USDC',
+    'Allowed Actions: zerion-proof-swap',
+    'Allowed Route: USDC->SOL',
+    `Expires At: ${p.expiresAt}`,
+    '',
+    'This signature authorizes one policy-limited Zerion proof execution.',
+    'It is not a transaction and does not spend funds by itself.',
+  ].join('\n')
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -106,7 +183,7 @@ export default function AgentPage() {
   const params = useParams()
   const router = useRouter()
   const wallet = useWallet()
-  const { apiCall } = useAuthContext()
+  const { status: authStatus, apiCall } = useAuthContext()
 
   const [agent,            setAgent]           = useState<Agent | null>(null)
   const [task,             setTask]            = useState('')
@@ -128,17 +205,88 @@ export default function AgentPage() {
   const [amountSpent,      setAmountSpent]     = useState(0)
   const [parsedIntent,     setParsedIntent]    = useState<ParsedIntent | null>(null)
   const [intentSource,     setIntentSource]    = useState<'llm'|'fallback'|null>(null)
+  const [policy,           setPolicy]          = useState<AutonomyPolicy | null>(null)
+  const [treasuryActions,  setTreasuryActions] = useState<StoredTreasuryAction[]>([])
+  const [treasuryBusy,     setTreasuryBusy]    = useState(false)
+  const [zerionMainnet,    setZerionMainnet]   = useState<ZerionMainnetWalletResponse & { lastSignature?: string } | null>(null)
   const timers = useRef<ReturnType<typeof setTimeout>[]>([])
 
   const isRunning  = runStatus !== 'idle' && runStatus !== 'done' && runStatus !== 'error'
   const isWaiting  = runStatus === 'signing-message' || runStatus === 'signing-tx'
+  const treasurySnapshot = useMemo(() => {
+    if (!agent) {
+      return createTreasurySnapshot({ agentId: '', publicKey: '', spentUsdc: 0 })
+    }
+    return createTreasurySnapshot({
+      agentId: agent.id,
+      publicKey: agent.treasuryWallet ?? 'unfunded',
+      solBalance: agent.treasurySol,
+      usdcBalance: agent.treasuryUsdc,
+      spentUsdc: agent.spent,
+    })
+  }, [agent])
+  const simulationLogs = useMemo(
+    () => buildRebalanceSimulation(treasurySnapshot, policy),
+    [treasurySnapshot, policy],
+  )
 
   // ─── Load agent ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    const found = loadAgents().find(a => a.id === params.id)
-    if (!found) router.push('/dashboard')
-    else setAgent(found)
-  }, [params.id, router])
+    let cancelled = false
+    const applyAgent = (found: Agent): void => {
+      if (cancelled) return
+          setAgent(found)
+      setTreasuryActions(loadTreasuryActions(found.id))
+      if (found.autonomyActive && found.autonomyExpiresAt) {
+        setPolicy({
+          ...buildDefaultPolicy(found.id, found.budget),
+          expiresAt: found.autonomyExpiresAt,
+          remainingUsdc: Math.max(0, found.budget - found.spent),
+          active: new Date(found.autonomyExpiresAt).getTime() > Date.now(),
+          signer: found.autonomySigner,
+          message: found.autonomyMessage,
+          signature: found.autonomySignature,
+        })
+      } else {
+        setPolicy(null)
+      }
+    }
+
+    async function loadAgent(): Promise<void> {
+      const agentId = String(params.id)
+      if (authStatus === 'authenticated') {
+        const res = await apiCall<{ agent: AgentListItem }>(`/api/agents/${encodeURIComponent(agentId)}`)
+        if (res.data?.agent) {
+          let nextAgent = apiAgentToStoreAgent(res.data.agent)
+          const ensureRes = await apiCall<EnsureTreasuryResponse>('/api/treasury/ensure', {
+            method: 'POST',
+            body: { agentId },
+          })
+          if (ensureRes.data?.success && ensureRes.data.publicKey !== nextAgent.treasuryWallet) {
+            nextAgent = { ...nextAgent, treasuryWallet: ensureRes.data.publicKey, treasurySol: 0 }
+          }
+          applyAgent(nextAgent)
+          const actionRes = await apiCall<{ actions: TreasuryActionItem[] }>(`/api/treasury/actions?agentId=${encodeURIComponent(agentId)}`)
+          if (!cancelled && actionRes.data?.actions) {
+            setTreasuryActions(actionRes.data.actions)
+          }
+          return
+        }
+        router.push('/dashboard')
+        return
+      }
+      if (wallet.connected) {
+        setAgent(null)
+        return
+      }
+      const found = loadAgents().find(a => a.id === agentId)
+      if (!found) router.push('/dashboard')
+      else applyAgent(found)
+    }
+
+    void loadAgent()
+    return () => { cancelled = true }
+  }, [apiCall, authStatus, params.id, router, wallet.connected])
 
   const updateAndSave = useCallback((updates: Partial<Agent>) => {
     setAgent(prev => {
@@ -148,6 +296,349 @@ export default function AgentPage() {
       return updated
     })
   }, [])
+
+  const refreshTreasuryBalances = useCallback(async () => {
+    if (!agent?.treasuryWallet) return
+    try {
+      const publicKey = new PublicKey(agent.treasuryWallet)
+      const [sol, usdc] = await Promise.all([
+        getSolBalance(publicKey),
+        getUsdcBalance(publicKey),
+      ])
+      updateAndSave({ treasurySol: sol, treasuryUsdc: usdc })
+    } catch {
+      // Treasury is not a valid on-chain pubkey yet; keep the current UI state.
+    }
+  }, [agent?.treasuryWallet, updateAndSave])
+
+  useEffect(() => {
+    void refreshTreasuryBalances()
+    const t = setInterval(() => void refreshTreasuryBalances(), 30_000)
+    return () => clearInterval(t)
+  }, [refreshTreasuryBalances])
+
+  const enableAutonomy = useCallback(async () => {
+    if (!agent || treasuryBusy) return
+    if (!wallet.connected || !wallet.publicKey || !wallet.signMessage) {
+      setErrorMsg('Connect Phantom and sign in before enabling autonomous mode.')
+      return
+    }
+    setTreasuryBusy(true)
+    try {
+      const fallbackPolicy = buildDefaultPolicy(agent.id, agent.budget)
+      const message = buildAutonomyMessage({
+        wallet: wallet.publicKey.toBase58(),
+        agentId: agent.id,
+        treasuryWallet: agent.treasuryWallet ?? 'unfunded',
+        spendLimitUsdc: fallbackPolicy.spendLimitUsdc,
+        expiresAt: fallbackPolicy.expiresAt,
+      })
+      const signed = await wallet.signMessage(new TextEncoder().encode(message))
+      const signature = bytesToBase64(signed)
+      const res = await apiCall<AutonomySessionResponse>('/api/treasury/session', {
+        method: 'POST',
+        body: {
+          agentId: agent.id,
+          budget: agent.budget,
+          wallet: wallet.publicKey.toBase58(),
+          message,
+          signature,
+          expiresAt: fallbackPolicy.expiresAt,
+        },
+      })
+      if (!res.data?.active) {
+        throw new Error(res.error ?? 'Autonomy authorization was rejected.')
+      }
+      const expiresAt = res.data?.expiresAt ?? fallbackPolicy.expiresAt
+      const nextPolicy: AutonomyPolicy = {
+        ...fallbackPolicy,
+        expiresAt,
+        spendLimitUsdc: res.data?.spendLimit ?? fallbackPolicy.spendLimitUsdc,
+        remainingUsdc: Math.max(0, agent.budget - agent.spent),
+        active: true,
+        signer: res.data.signer,
+        message: res.data.message,
+        signature: res.data.signature,
+      }
+      setPolicy(nextPolicy)
+      updateAndSave({
+        autonomyActive: true,
+        autonomyExpiresAt: expiresAt,
+        autonomySigner: res.data.signer,
+        autonomyMessage: res.data.message,
+        autonomySignature: res.data.signature,
+      })
+      const action = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'policy-check',
+        amount: nextPolicy.spendLimitUsdc,
+        status: 'validated',
+        detail: '24h autonomous policy session enabled with devnet-only constraints.',
+      })
+      saveTreasuryAction(action)
+      setTreasuryActions(loadTreasuryActions(agent.id))
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Autonomy authorization failed.')
+    } finally {
+      setTreasuryBusy(false)
+    }
+  }, [agent, apiCall, treasuryBusy, updateAndSave, wallet])
+
+  const rebalanceGas = useCallback(async () => {
+    if (!agent || treasuryBusy) return
+    setTreasuryBusy(true)
+    const simulation = createLocalTreasuryAction({
+      agentId: agent.id,
+      type: 'simulation',
+      amount: 0,
+      status: 'simulated',
+      detail: 'Zerion engine simulated gas runway, slippage envelope, and policy limits.',
+    })
+    saveTreasuryAction(simulation)
+    try {
+      const res = await apiCall<RebalanceResponse>('/api/treasury/rebalance', {
+        method: 'POST',
+        body: {
+          agentId: agent.id,
+          targetSol: 0.08,
+          amountUsdc: 1,
+          walletName: agent.zerionWalletName ?? `forge-${agent.id}`,
+          policyMessage: policy?.message ?? agent.autonomyMessage,
+          policySignature: policy?.signature ?? agent.autonomySignature,
+          policySigner: policy?.signer ?? agent.autonomySigner,
+        },
+      })
+      const rebalanceData = res.data
+      if (!rebalanceData?.success) {
+        const cliDetail = [
+          res.data?.detail ?? res.error ?? 'Zerion CLI did not return a real devnet transaction signature.',
+          res.data?.stderr ? `CLI stderr: ${res.data.stderr.slice(0, 280)}` : '',
+          res.data?.command ? `Command: ${res.data.command}` : '',
+        ].filter(Boolean).join(' ')
+        const rejected = createLocalTreasuryAction({
+          agentId: agent.id,
+          type: 'gas-rebalance',
+          amount: 1,
+          status: 'rejected',
+          detail: cliDetail,
+        })
+        saveTreasuryAction(rejected)
+        setErrorMsg(rejected.detail)
+        return
+      }
+      const action = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'gas-rebalance',
+        amount: 0.08,
+        status: 'executed',
+        txSignature: rebalanceData.signature,
+        detail: rebalanceData.detail,
+      })
+      saveTreasuryAction(action)
+      updateAndSave({
+        treasurySol: Math.max(0.08, agent.treasurySol ?? 0.014),
+        treasuryTxCount: (agent.treasuryTxCount ?? agent.taskCount) + 1,
+      })
+    } finally {
+      setTreasuryActions(loadTreasuryActions(agent.id))
+      setTreasuryBusy(false)
+    }
+  }, [agent, apiCall, policy, treasuryBusy, updateAndSave])
+
+  const emergencyPause = useCallback(async () => {
+    if (!agent || treasuryBusy) return
+    setTreasuryBusy(true)
+    try {
+      const res = await apiCall<PauseAutonomyResponse>('/api/treasury/pause', {
+        method: 'POST',
+        body: { agentId: agent.id },
+      })
+      if (!res.data?.success) {
+        throw new Error(res.error ?? 'Emergency pause failed.')
+      }
+      setPolicy(null)
+      updateAndSave({
+        autonomyActive: false,
+        autonomyExpiresAt: undefined,
+        autonomySignature: undefined,
+        autonomyMessage: undefined,
+        autonomySigner: undefined,
+      })
+      const action = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'emergency-pause',
+        amount: 0,
+        status: 'executed',
+        detail: res.data.detail,
+      })
+      saveTreasuryAction(action)
+      setTreasuryActions(loadTreasuryActions(agent.id))
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Emergency pause failed.')
+    } finally {
+      setTreasuryBusy(false)
+    }
+  }, [agent, apiCall, treasuryBusy, updateAndSave])
+
+  const fundTreasurySol = useCallback(async () => {
+    if (!agent?.treasuryWallet || !wallet.publicKey || !wallet.sendTransaction) {
+      setErrorMsg('Connect Phantom before funding the agent treasury.')
+      return
+    }
+    setTreasuryBusy(true)
+    try {
+      const connection = new Connection(SOLANA_RPC, 'confirmed')
+      const to = new PublicKey(agent.treasuryWallet)
+      const tx = new Transaction().add(SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: to,
+        lamports: Math.round(0.05 * LAMPORTS_PER_SOL),
+      }))
+      const sig = await wallet.sendTransaction(tx, connection)
+      await connection.confirmTransaction(sig, 'confirmed')
+      const action = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'funding',
+        amount: 0.05,
+        status: 'executed',
+        txSignature: sig,
+        detail: 'User funded agent treasury with devnet SOL from Phantom.',
+      })
+      saveTreasuryAction(action)
+      await refreshTreasuryBalances()
+      setTreasuryActions(loadTreasuryActions(agent.id))
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'SOL funding failed.')
+    } finally {
+      setTreasuryBusy(false)
+    }
+  }, [agent, refreshTreasuryBalances, wallet.publicKey, wallet.sendTransaction])
+
+  const fundTreasuryUsdc = useCallback(async () => {
+    if (!agent?.treasuryWallet || !wallet.publicKey || !wallet.sendTransaction) {
+      setErrorMsg('Connect Phantom before funding the agent treasury.')
+      return
+    }
+    setTreasuryBusy(true)
+    try {
+      const connection = new Connection(SOLANA_RPC, 'confirmed')
+      const mint = new PublicKey(USDC_MINT)
+      const owner = wallet.publicKey
+      const treasury = new PublicKey(agent.treasuryWallet)
+      const fromAta = await getAssociatedTokenAddress(mint, owner)
+      const toAta = await getAssociatedTokenAddress(mint, treasury)
+      const tx = new Transaction()
+      try {
+        await getAccount(connection, toAta)
+      } catch {
+        tx.add(createAssociatedTokenAccountInstruction(owner, toAta, treasury, mint))
+      }
+      tx.add(createTransferInstruction(fromAta, toAta, owner, 2_000_000))
+      const sig = await wallet.sendTransaction(tx, connection)
+      await connection.confirmTransaction(sig, 'confirmed')
+      const action = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'funding',
+        tokenIn: 'USDC',
+        amount: 2,
+        status: 'executed',
+        txSignature: sig,
+        detail: 'User funded agent treasury with devnet USDC from Phantom.',
+      })
+      saveTreasuryAction(action)
+      await refreshTreasuryBalances()
+      setTreasuryActions(loadTreasuryActions(agent.id))
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'USDC funding failed. Make sure your Phantom wallet has devnet USDC for the Forge mint.')
+    } finally {
+      setTreasuryBusy(false)
+    }
+  }, [agent, refreshTreasuryBalances, wallet.publicKey, wallet.sendTransaction])
+
+  const loadZerionMainnet = useCallback(async () => {
+    if (!agent) return
+    try {
+      const res = await apiCall<ZerionMainnetWalletResponse>(`/api/zerion/mainnet-wallet?agentId=${encodeURIComponent(agent.id)}`)
+      if (res.data) {
+        const next = res.data
+        setZerionMainnet(prev => ({ ...next, lastSignature: prev?.lastSignature }))
+      }
+      else if (res.error) setErrorMsg(res.error)
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not load Zerion mainnet wallet.')
+    }
+  }, [agent, apiCall])
+
+  const runZerionProofSwap = useCallback(async () => {
+    if (!agent || !wallet.publicKey || !wallet.signMessage || treasuryBusy) return
+    setTreasuryBusy(true)
+    try {
+      let proofWallet = zerionMainnet
+      if (!proofWallet) {
+        const walletRes = await apiCall<ZerionMainnetWalletResponse>(`/api/zerion/mainnet-wallet?agentId=${encodeURIComponent(agent.id)}`)
+        if (!walletRes.data) throw new Error(walletRes.error ?? 'Could not create Zerion mainnet wallet.')
+        proofWallet = walletRes.data
+        setZerionMainnet(proofWallet)
+      }
+      const expiresAt = policy?.expiresAt ?? buildDefaultPolicy(agent.id, agent.budget).expiresAt
+      const message = buildZerionProofMessage({
+        wallet: wallet.publicKey.toBase58(),
+        agentId: agent.id,
+        executionWallet: proofWallet.publicKey,
+        spendLimitUsdc: 1,
+        expiresAt,
+      })
+      const signed = await wallet.signMessage(new TextEncoder().encode(message))
+      const signature = bytesToBase64(signed)
+      const simulation = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'simulation',
+        amount: 1,
+        status: 'validated',
+        detail: 'Zerion proof agent validated solana-mainnet, USDC->SOL route, 1 USDC cap, and expiry window.',
+      })
+      saveTreasuryAction(simulation)
+      const res = await apiCall<ZerionProofSwapResponse>('/api/zerion/proof-swap', {
+        method: 'POST',
+        body: {
+          agentId: agent.id,
+          amountUsdc: 1,
+          policyMessage: message,
+          policySignature: signature,
+          policySigner: wallet.publicKey.toBase58(),
+        },
+      })
+      if (!res.data?.success || !res.data.signature) {
+        const rejected = createLocalTreasuryAction({
+          agentId: agent.id,
+          type: 'zerion-proof-swap',
+          amount: 1,
+          status: 'rejected',
+          detail: res.error ?? res.data?.detail ?? 'Zerion proof swap did not execute.',
+        })
+        saveTreasuryAction(rejected)
+        throw new Error(rejected.detail)
+      }
+      const action = createLocalTreasuryAction({
+        agentId: agent.id,
+        type: 'zerion-proof-swap',
+        amount: 1,
+        status: 'executed',
+        txSignature: res.data.signature,
+        detail: res.data.detail,
+      })
+      saveTreasuryAction(action)
+      const proofSignature = res.data.signature
+      setZerionMainnet(prev => prev ? { ...prev, lastSignature: proofSignature } : prev)
+      setTreasuryActions(loadTreasuryActions(agent.id))
+      await loadZerionMainnet()
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Zerion proof swap failed.')
+      if (agent) setTreasuryActions(loadTreasuryActions(agent.id))
+    } finally {
+      setTreasuryBusy(false)
+    }
+  }, [agent, apiCall, loadZerionMainnet, policy?.expiresAt, treasuryBusy, wallet.publicKey, wallet.signMessage, zerionMainnet])
 
   const addStep  = useCallback((step: AgentStep) => setSteps(p => [...p, step]), [])
   const delay    = (ms: number) => new Promise<void>(r => {
@@ -195,7 +686,12 @@ export default function AgentPage() {
   const runTask = useCallback(async () => {
     if (!task.trim() || isRunning || !agent) return
 
-    if (!wallet.connected || !wallet.publicKey || !wallet.signTransaction || !wallet.signMessage) {
+    const autonomyReady =
+      !!agent.autonomyActive &&
+      !!policy?.active &&
+      !!policy.signature &&
+      new Date(policy.expiresAt).getTime() > Date.now()
+    if (!autonomyReady && (!wallet.connected || !wallet.publicKey || !wallet.signTransaction || !wallet.signMessage)) {
       setErrorMsg('Connect your Phantom wallet (set to Devnet) first.')
       return
     }
@@ -204,6 +700,16 @@ export default function AgentPage() {
     setRunStatus('parsing')
     setActiveTab('activity')
     updateAndSave({ status: 'running' })
+    for (const log of simulationLogs) {
+      addStep({
+        id: `zerion-${log.id}-${Date.now()}`,
+        phase: 'agent',
+        icon: log.status === 'blocked' ? 'shield' : 'activity',
+        color: log.status === 'blocked' ? '#F87171' : log.status === 'warning' ? '#FBBF24' : '#67E8F9',
+        label: `Zerion: ${log.label}`,
+        detail: log.detail,
+      })
+    }
 
     // ── 1. Parse intent ───────────────────────────────────────────────────────
     let intent: ParsedIntent = {
@@ -262,18 +768,45 @@ export default function AgentPage() {
     // ── 4. Payment gate ───────────────────────────────────────────────────────
     addStep(paymentStep)
     setShowPayment(true)
-    setRunStatus('signing-message')
+    setRunStatus(autonomyReady ? 'paying' : 'signing-message')
 
     let payment: PaymentResult
 
     try {
       const { SIMULATE_PAYMENTS } = await import('@/lib/config')
 
-      // Feature flag: simulation mode for demos without real USDC
+      // Feature flag: simulation mode for demos without real USDC.
       if (SIMULATE_PAYMENTS) {
         await delay(3000)
         payment = { success: true, usedRealPayment: false, erSessionId: erSession.id }
+      } else if (autonomyReady) {
+        setRunStatus('paying')
+        const treasuryPayment = await apiCall<TreasuryPaymentResponse>('/api/agent/treasury-payment', {
+          method: 'POST',
+          body: {
+            agentId: agent.id,
+            providerId: provider.id,
+            toAddress: provider.wallet,
+            amountUsdc: cost,
+            erSessionId: erSession.id,
+            policyMessage: policy?.message ?? agent.autonomyMessage,
+            policySignature: policy?.signature ?? agent.autonomySignature,
+            policySigner: policy?.signer ?? agent.autonomySigner,
+          },
+        })
+        if (!treasuryPayment.data?.success) {
+          throw new Error(treasuryPayment.error ?? 'Treasury-signed MagicBlock payment failed.')
+        }
+        payment = {
+          success: true,
+          signature: treasuryPayment.data.signature,
+          usedRealPayment: treasuryPayment.data.usedRealPayment,
+          erSessionId: treasuryPayment.data.erSessionId,
+        }
       } else {
+        if (!wallet.publicKey || !wallet.signTransaction || !wallet.signMessage) {
+          throw new Error('Wallet signatures unavailable for real MagicBlock payment.')
+        }
         // Real MagicBlock flow — all tx logic in lib/magicblock.ts
         // Step A: getMBAuthToken() via signMessage → Phantom "Sign Message" (free)
         // Step B: ensureUsdcAta() pre-creates ATA in separate tx if needed
@@ -372,15 +905,16 @@ export default function AgentPage() {
     // ── 7. Finalise ────────────────────────────────────────────────────────────
     setShowReceipt(true)
     setRunStatus('done')
-    setActiveTab('task')
     updateAndSave({
       status:      'idle',
       spent:       agent.spent + cost,
       taskCount:   agent.taskCount + 1,
       lastTask:    task,
       successRate: Math.min(100, Math.round((agent.successRate * agent.taskCount + 100) / (agent.taskCount + 1))),
+      treasuryUsdc: Math.max(0, (agent.treasuryUsdc ?? agent.budget) - cost),
+      treasuryTxCount: (agent.treasuryTxCount ?? agent.taskCount) + 1,
     })
-  }, [task, isRunning, agent, wallet, apiCall, reset, updateAndSave, addStep, delay])
+  }, [task, isRunning, agent, policy, simulationLogs, wallet, apiCall, reset, updateAndSave, addStep, delay])
 
   // ─── Loading state ────────────────────────────────────────────────────────────
   if (!agent) {
@@ -600,6 +1134,38 @@ export default function AgentPage() {
                         : runStatus === 'signing-tx'    ? 'sign-tx'
                         : null
                       } />
+                    {taskOutput && (
+                      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} style={{ marginTop: 18 }}>
+                        <div className="lg-card" style={{ overflow: 'hidden' }}>
+                          <div style={{ position: 'relative', height: 180 }}>
+                            <img src={taskOutput.image} alt="Task output" style={{ width: '100%', height: 180, objectFit: 'cover', display: 'block' }} />
+                            <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to top,rgba(6,8,15,0.85) 0%,transparent 60%)' }} />
+                            <div style={{ position: 'absolute', bottom: 12, left: 16, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                              <span className="lg-pill lg-pill-emerald">Output Ready</span>
+                              {paymentResult?.usedRealPayment && <span className="lg-pill lg-pill-violet">ER Real</span>}
+                              {taskOutput.usedRealInference
+                                ? <span className="lg-pill lg-pill-cyan">AI Image</span>
+                                : <span className="lg-pill lg-pill-amber">Placeholder</span>}
+                            </div>
+                          </div>
+                          <div style={{ padding: '14px 18px' }}>
+                            <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.55)', lineHeight: 1.6, marginBottom: 10 }}>{taskOutput.text}</div>
+                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                              <button onClick={() => setActiveTab('task')} className="lg-btn-primary" style={{ fontSize: 11, padding: '7px 11px' }}>Open result</button>
+                              <button onClick={() => setShowPreview(true)} className="lg-btn-ghost" style={{ fontSize: 11, padding: '7px 11px' }}>Preview</button>
+                              <button onClick={() => void downloadOutput()} className="lg-btn-ghost" style={{ fontSize: 11, padding: '7px 11px' }}>Download</button>
+                            </div>
+                          </div>
+                        </div>
+                        {showReceipt && (
+                          <div style={{ marginTop: 14 }}>
+                            <ZKReceipt task={task} providerName={selectedProvider?.name ?? 'GPU Alpha'}
+                              amount={amountSpent} signature={paymentResult?.signature}
+                              usedRealPayment={paymentResult?.usedRealPayment} />
+                          </div>
+                        )}
+                      </motion.div>
+                    )}
                   </div>
                 </motion.div>
               )}
@@ -658,6 +1224,23 @@ export default function AgentPage() {
 
             {/* Right panel */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <TreasuryIntelligencePanel
+                agent={agent}
+                snapshot={treasurySnapshot}
+                policy={policy}
+                simulationLogs={simulationLogs}
+                actions={treasuryActions}
+                onEnableAutonomy={() => void enableAutonomy()}
+                onRebalance={() => void rebalanceGas()}
+                onEmergencyPause={() => void emergencyPause()}
+                onFundSol={() => void fundTreasurySol()}
+                onFundUsdc={() => void fundTreasuryUsdc()}
+                onLoadZerionMainnet={() => void loadZerionMainnet()}
+                onRunZerionProof={() => void runZerionProofSwap()}
+                zerionMainnet={zerionMainnet}
+                isBusy={treasuryBusy}
+              />
+
               <div className="lg-card" style={{ padding: 20 }}>
                 <div style={{ fontFamily: 'Syne,sans-serif', fontSize: 13, fontWeight: 700, marginBottom: 14 }}>Agent Stats</div>
                 {[
@@ -746,6 +1329,9 @@ export default function AgentPage() {
             }
             paymentDone={!!paymentResult}
             usedRealPayment={paymentResult?.usedRealPayment}
+            mode={policy?.active ? 'treasury' : 'wallet'}
+            treasuryWallet={agent?.treasuryWallet}
+            signature={paymentResult?.signature}
             onComplete={() => setShowPayment(false)}
           />
         )}

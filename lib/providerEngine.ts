@@ -42,7 +42,7 @@ export const PROVIDER_REGISTRY: Provider[] = [
     pricePerSec: 0.018, latencyMs: 12, uptimePct: 99.8, rating: 4.9, logo: '⚡',
     walletAddress: '3rXKwQ1kpjBd5tdcco32qsvqUh1BnZjcYnS5kYrP7AYE',
     replicateModel: 'stability-ai/sdxl',
-    supportsTypes: ['image-generation', 'upscale', 'compute'],
+    supportsTypes: ['image-generation', 'upscale', 'compute', 'inference'],
     successRate: 1.0, avgResponseMs: 12, lastHealthCheck: 0, isHealthy: true,
   },
   {
@@ -50,21 +50,21 @@ export const PROVIDER_REGISTRY: Provider[] = [
     pricePerSec: 0.022, latencyMs: 8, uptimePct: 99.5, rating: 4.7, logo: '🔷',
     walletAddress: 'Bt9oNR5cCtnfuMmXgWELd6q5i974PdEMQDUE55nBC57L',
     replicateModel: 'stability-ai/sdxl',
-    supportsTypes: ['image-generation', 'compute'],
+    supportsTypes: ['image-generation', 'compute', 'inference'],
     successRate: 1.0, avgResponseMs: 8, lastHealthCheck: 0, isHealthy: true,
   },
   {
     id: 'rendernet', name: 'RenderNet', type: 'GPU Render',
     pricePerSec: 0.024, latencyMs: 15, uptimePct: 99.9, rating: 4.8, logo: '🌐',
     walletAddress: 'FtLZJ4ckCT3SkW4PXhBY6dP7pJ7WYc1Q3X4sNNkPqW2v',
-    supportsTypes: ['image-generation', 'upscale'],
+    supportsTypes: ['image-generation', 'upscale', 'compute'],
     successRate: 1.0, avgResponseMs: 15, lastHealthCheck: 0, isHealthy: true,
   },
   {
     id: 'fastgpu', name: 'FastGPU', type: 'GPU Compute',
     pricePerSec: 0.031, latencyMs: 6, uptimePct: 99.7, rating: 4.6, logo: '🚀',
     walletAddress: 'HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH',
-    supportsTypes: ['image-generation', 'training', 'compute'],
+    supportsTypes: ['image-generation', 'training', 'compute', 'data-fetching'],
     successRate: 1.0, avgResponseMs: 6, lastHealthCheck: 0, isHealthy: true,
   },
   {
@@ -72,7 +72,7 @@ export const PROVIDER_REGISTRY: Provider[] = [
     pricePerSec: 0.015, latencyMs: 20, uptimePct: 98.9, rating: 4.4, logo: '☁️',
     walletAddress: 'DzHPLnWAoABFQJHGnS7G5bWskyNpNrB9CsH4aF2xrVeM',
     togetherModel: 'stabilityai/stable-diffusion-xl-base-1.0',
-    supportsTypes: ['inference', 'image-generation'],
+    supportsTypes: ['inference', 'image-generation', 'text-generation', 'research', 'data-fetching'],
     successRate: 1.0, avgResponseMs: 20, lastHealthCheck: 0, isHealthy: true,
   },
 ]

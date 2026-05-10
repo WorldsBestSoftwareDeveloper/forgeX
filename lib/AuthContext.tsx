@@ -63,12 +63,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           body: body !== undefined ? JSON.stringify(body) : undefined,
         })
 
-        const data = (await res.json()) as T | { error?: string }
+        const text = await res.text()
+        const data = text
+          ? (JSON.parse(text) as T | { error?: string; detail?: string })
+          : ({} as T | { error?: string; detail?: string })
 
         if (!res.ok) {
+          const errBody = data as { error?: string; detail?: string }
           return {
             data: null,
-            error: (data as { error?: string }).error ?? `HTTP ${res.status}`,
+            error: errBody.error ?? errBody.detail ?? `HTTP ${res.status}`,
             status: res.status,
           }
         }

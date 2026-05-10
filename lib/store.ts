@@ -13,6 +13,16 @@ export interface Agent {
   successRate: number
   taskCount:   number
   created:     string
+  treasuryWallet?: string
+  autonomyActive?: boolean
+  autonomyExpiresAt?: string
+  autonomySignature?: string
+  autonomyMessage?: string
+  autonomySigner?: string
+  treasurySol?: number
+  treasuryUsdc?: number
+  treasuryTxCount?: number
+  zerionWalletName?: string
 }
 
 export interface Transaction {
@@ -27,6 +37,17 @@ export interface Transaction {
   provider?:       string
   usedRealPayment?: boolean
   erSessionId?:    string
+}
+
+export interface StoredTreasuryAction {
+  id: string
+  agentId: string
+  type: string
+  detail: string
+  amount: number
+  txSignature?: string
+  status: 'simulated' | 'validated' | 'executed' | 'rejected'
+  createdAt: string
 }
 
 // ─── Default demo agents ──────────────────────────────────────────────────────
@@ -48,6 +69,11 @@ export function loadAgents(): Agent[] {
 export function saveAgents(agents: Agent[]): void {
   if (typeof window === 'undefined') return
   try { localStorage.setItem('forge-agents', JSON.stringify(agents)) } catch {}
+}
+
+export function upsertAgent(agent: Agent): void {
+  const agents = loadAgents()
+  saveAgents(agents.map(a => a.id === agent.id ? agent : a))
 }
 
 // ─── Transactions — live updates via CustomEvent ──────────────────────────────
@@ -74,4 +100,25 @@ export function saveTransaction(tx: Transaction): void {
 export function clearTransactions(): void {
   if (typeof window === 'undefined') return
   try { localStorage.removeItem('forge-transactions') } catch {}
+}
+
+export function loadTreasuryActions(agentId?: string): StoredTreasuryAction[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const s = localStorage.getItem('forge-treasury-actions')
+    const actions: StoredTreasuryAction[] = s ? (JSON.parse(s) as StoredTreasuryAction[]) : []
+    return actions
+      .filter(a => !agentId || a.agentId === agentId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+  } catch { return [] }
+}
+
+export function saveTreasuryAction(action: StoredTreasuryAction): void {
+  if (typeof window === 'undefined') return
+  try {
+    const existing = loadTreasuryActions()
+    const updated = [action, ...existing.filter(a => a.id !== action.id)]
+    localStorage.setItem('forge-treasury-actions', JSON.stringify(updated))
+    window.dispatchEvent(new CustomEvent('forge-treasury-action', { detail: action }))
+  } catch {}
 }

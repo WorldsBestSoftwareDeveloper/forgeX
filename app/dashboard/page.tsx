@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useWallet }              from '@solana/wallet-adapter-react'
+import { PublicKey }               from '@solana/web3.js'
 import Link                        from 'next/link'
 import { Navbar }                  from '@/components/Navbar'
 import { Sidebar }                 from '@/components/Sidebar'
@@ -10,6 +11,11 @@ import { useAuthContext }          from '@/lib/AuthContext'
 import { Agent, loadAgents, saveAgents } from '@/lib/store'
 import { motion, AnimatePresence } from 'framer-motion'
 import { validateAgentName, validateBudget } from '@/lib/security'
+import { getSolBalance, getUsdcBalance } from '@/lib/payment'
+import type { CreateTreasuryResponse } from '@/app/api/treasury/create/route'
+import type { AgentListItem } from '@/app/api/agents/route'
+import type { DeleteAgentResponse } from '@/app/api/agents/[id]/route'
+import { apiAgentToStoreAgent } from '@/lib/agentMapper'
 
 const AGENT_EMOJIS: Record<string, string> = {
   'Nexus-7': '🔮', 'Prism-X': '💎', 'Sigma-3': '⚡',
@@ -33,7 +39,7 @@ function SpendBar({ spent, budget }: { spent: number; budget: number }) {
 
 interface CreateModalProps {
   onClose:  () => void
-  onCreate: (name: string, budget: number) => void
+  onCreate: (name: string, budget: number) => Promise<void>
 }
 
 function CreateModal({ onClose, onCreate }: CreateModalProps) {
@@ -60,8 +66,7 @@ function CreateModal({ onClose, onCreate }: CreateModalProps) {
       return
     }
 
-    onCreate(finalName, finalBudget)
-    onClose()
+    void onCreate(finalName, finalBudget).then(onClose)
   }
 
   return (
@@ -85,7 +90,7 @@ function CreateModal({ onClose, onCreate }: CreateModalProps) {
 
         <div style={{ marginBottom: 24 }}>
           <div style={{ fontFamily: 'Syne,sans-serif', fontSize: 20, fontWeight: 700, marginBottom: 4 }}>Deploy New Agent</div>
-          <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)' }}>Configure your autonomous payment agent</div>
+          <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)' }}>Set its policy budget, then fund the generated treasury wallet</div>
         </div>
 
         <div style={{ marginBottom: 18 }}>
@@ -102,7 +107,7 @@ function CreateModal({ onClose, onCreate }: CreateModalProps) {
         </div>
 
         <div style={{ marginBottom: 26 }}>
-          <label style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.38)', display: 'block', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.07em' }}>Budget (USDC)</label>
+          <label style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.38)', display: 'block', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.07em' }}>Policy Budget (USDC)</label>
           <input
             type="number"
             step="0.5"
@@ -114,7 +119,7 @@ function CreateModal({ onClose, onCreate }: CreateModalProps) {
             onChange={e => { setBudget(e.target.value); setBudgetError('') }}
           />
           {budgetError && <div style={{ fontSize: 11, color: '#F87171', marginTop: 5 }}>{budgetError}</div>}
-          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.22)', marginTop: 5 }}>Max $1,000 · Enforced server-side</div>
+          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.22)', marginTop: 5 }}>This is the max the agent may spend. Actual funds are deposited into the treasury wallet after creation.</div>
         </div>
 
         <div style={{ display: 'flex', gap: 10 }}>
@@ -128,15 +133,74 @@ function CreateModal({ onClose, onCreate }: CreateModalProps) {
 
 export default function DashboardPage() {
   const { connected }          = useWallet()
-  const { status: authStatus } = useAuthContext()
+  const { status: authStatus, wallet: authWallet, apiCall } = useAuthContext()
   const [agents,      setAgents]      = useState<Agent[]>([])
   const [showCreate,  setShowCreate]  = useState(false)
+  const [loadingAgents, setLoadingAgents] = useState(false)
+  const [deletingAgentId, setDeletingAgentId] = useState<string | null>(null)
 
-  useEffect(() => { setAgents(loadAgents()) }, [])
+  const hydrateLiveAgentStats = useCallback(async (baseAgents: Agent[]): Promise<Agent[]> => {
+    return Promise.all(baseAgents.map(async (agent) => {
+      if (!agent.treasuryWallet) return agent
+      try {
+        const publicKey = new PublicKey(agent.treasuryWallet)
+        const [sol, usdc, actionsRes] = await Promise.all([
+          getSolBalance(publicKey),
+          getUsdcBalance(publicKey),
+          apiCall<{ actions: Array<{ txSignature?: string | null }> }>(`/api/treasury/actions?agentId=${encodeURIComponent(agent.id)}`),
+        ])
+        const realTxCount = (actionsRes.data?.actions ?? []).filter(a => !!a.txSignature).length
+        return {
+          ...agent,
+          treasurySol: sol,
+          treasuryUsdc: usdc,
+          treasuryTxCount: realTxCount || agent.treasuryTxCount || agent.taskCount,
+        }
+      } catch {
+        return agent
+      }
+    }))
+  }, [apiCall])
 
-  const createAgent = useCallback((name: string, budget: number) => {
+  useEffect(() => {
+    let cancelled = false
+    async function loadWalletAgents(): Promise<void> {
+      if (authStatus !== 'authenticated') {
+        if (connected) {
+          setAgents([])
+          return
+        }
+        setAgents(loadAgents())
+        return
+      }
+      setLoadingAgents(true)
+      const res = await apiCall<{ agents: AgentListItem[] }>('/api/agents')
+      if (!cancelled) {
+        const walletAgents: Agent[] = await hydrateLiveAgentStats((res.data?.agents ?? []).map(apiAgentToStoreAgent))
+        setAgents(walletAgents)
+      }
+      setLoadingAgents(false)
+    }
+    void loadWalletAgents()
+    return () => { cancelled = true }
+  }, [apiCall, authStatus, authWallet, connected, hydrateLiveAgentStats])
+
+  const createAgent = useCallback(async (name: string, budget: number) => {
+    const agentId = `agent-${Date.now()}`
+    let treasuryWallet = `devnet-treasury-${agentId.slice(-6)}`
+    if (authStatus === 'authenticated') {
+      const res = await apiCall<CreateTreasuryResponse>('/api/treasury/create', {
+        method: 'POST',
+        body: { agentId, name, budget },
+      })
+      if (!res.data?.publicKey || !res.data.persisted) {
+        throw new Error(res.error ?? 'Could not create encrypted treasury wallet in Supabase.')
+      }
+      treasuryWallet = res.data.publicKey
+    }
+
     const newAgent: Agent = {
-      id:          `agent-${Date.now()}`,
+      id:          agentId,
       name,
       budget,
       spent:       0,
@@ -145,14 +209,57 @@ export default function DashboardPage() {
       successRate: 100,
       taskCount:   0,
       created:     new Date().toISOString().split('T')[0],
+      treasuryWallet,
+      autonomyActive: false,
+      treasurySol: 0.014,
+      treasuryUsdc: budget,
+      treasuryTxCount: 0,
+      zerionWalletName: `forge-${agentId}`,
+    }
+    if (authStatus === 'authenticated') {
+      const refreshed = await apiCall<{ agents: AgentListItem[] }>('/api/agents')
+      setAgents(await hydrateLiveAgentStats((refreshed.data?.agents ?? []).map(apiAgentToStoreAgent)))
+      return
     }
     const updated = [...agents, newAgent]
     setAgents(updated)
     saveAgents(updated)
-  }, [agents])
+  }, [agents, apiCall, authStatus, hydrateLiveAgentStats])
+
+  const retireAgent = useCallback(async (agent: Agent) => {
+    const ok = window.confirm(`Retire ${agent.name}? This removes the agent and its treasury session history from Forge.`)
+    if (!ok) return
+    setDeletingAgentId(agent.id)
+    try {
+      if (authStatus === 'authenticated') {
+        const res = await apiCall<DeleteAgentResponse>(`/api/agents/${encodeURIComponent(agent.id)}`, {
+          method: 'DELETE',
+        })
+        if (!res.data?.success) {
+          throw new Error(res.error ?? 'Could not retire agent.')
+        }
+        const refreshed = await apiCall<{ agents: AgentListItem[] }>('/api/agents')
+        const walletAgents = await hydrateLiveAgentStats((refreshed.data?.agents ?? []).map(apiAgentToStoreAgent))
+        setAgents(walletAgents)
+        return
+      }
+      const updated = loadAgents().filter(a => a.id !== agent.id)
+      saveAgents(updated)
+      setAgents(prev => prev.filter(a => a.id !== agent.id))
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : 'Could not retire agent.')
+    } finally {
+      setDeletingAgentId(null)
+    }
+  }, [apiCall, authStatus, hydrateLiveAgentStats])
 
   const totalBudget = agents.reduce((a, b) => a + b.budget, 0)
   const totalTasks  = agents.reduce((a, b) => a + b.taskCount, 0)
+  const autonomousAgents = agents.filter(a => a.autonomyActive).length
+  const privateVolume = agents.reduce((a, b) => a + b.spent, 0)
+  const treasuryHealth = agents.length
+    ? Math.round(agents.reduce((a, b) => a + Math.min(100, ((b.treasurySol ?? 0) * 500) + ((b.treasuryUsdc ?? 0) * 2)), 0) / agents.length)
+    : 0
   const avgSuccess  = agents.length
     ? Math.round(agents.reduce((a, b) => a + b.successRate, 0) / agents.length)
     : 0
@@ -205,9 +312,9 @@ export default function DashboardPage() {
           <div className="forge-stats-grid">
             {[
               { label: 'Active Agents', value: agents.length,                icon: '◎', color: '#818CF8' },
-              { label: 'Total Budget',  value: `$${totalBudget.toFixed(2)}`, icon: '◈', color: '#34D399' },
-              { label: 'Tasks Run',     value: totalTasks,                   icon: '⚡', color: '#FBBF24' },
-              { label: 'Avg Success',   value: `${avgSuccess}%`,             icon: '🏆', color: '#34D399' },
+              { label: 'Private Volume', value: `$${privateVolume.toFixed(2)}`, icon: '◈', color: '#34D399' },
+              { label: 'Autonomous',     value: autonomousAgents,              icon: '⚡', color: '#FBBF24' },
+              { label: 'Treasury Health', value: `${treasuryHealth || avgSuccess}%`, icon: '◇', color: '#67E8F9' },
             ].map((stat, i) => (
               <motion.div
                 key={stat.label}
@@ -227,6 +334,11 @@ export default function DashboardPage() {
           </div>
 
           {/* Agent cards */}
+          {loadingAgents && (
+            <div className="lg-card" style={{ padding: '12px 16px', marginBottom: 14, borderRadius: 12, color: 'rgba(255,255,255,0.38)', fontSize: 13 }}>
+              Loading wallet-scoped agents from Supabase...
+            </div>
+          )}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(290px,1fr))', gap: 14 }}>
             <AnimatePresence>
               {agents.map((agent, i) => (
@@ -269,11 +381,51 @@ export default function DashboardPage() {
                         <span style={{ color: '#818CF8', flexShrink: 0, marginTop: 1 }}>▸</span>
                         <span style={{ lineHeight: 1.4 }}>{agent.lastTask}</span>
                       </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8, marginTop: 12 }}>
+                        {[
+                          ['Treasury', `$${(agent.treasuryUsdc ?? Math.max(0, agent.budget - agent.spent)).toFixed(2)}`],
+                          ['Gas', `${(agent.treasurySol ?? 0.014).toFixed(3)} SOL`],
+                          ['Tx', String(agent.treasuryTxCount ?? agent.taskCount)],
+                        ].map(([label, value]) => (
+                          <div key={label} style={{ background: 'rgba(255,255,255,0.035)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 10, padding: '7px 8px' }}>
+                            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.25)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 3 }}>{label}</div>
+                            <div style={{ fontSize: 11, color: 'rgba(240,242,255,0.72)', fontFamily: 'JetBrains Mono,monospace' }}>{value}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, gap: 8 }}>
+                        <span className={`lg-pill ${agent.autonomyActive ? 'lg-pill-emerald' : 'lg-pill-amber'}`}>
+                          {agent.autonomyActive ? 'Autonomy active' : 'Autonomy off'}
+                        </span>
+                        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.28)', fontFamily: 'JetBrains Mono,monospace' }}>
+                          {agent.treasuryWallet ? `${agent.treasuryWallet.slice(0, 4)}...${agent.treasuryWallet.slice(-4)}` : 'No treasury'}
+                        </span>
+                      </div>
                       <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
                         <span style={{ fontSize: 12, color: '#818CF8', fontWeight: 600 }}>Open agent →</span>
                       </div>
                     </div>
                   </Link>
+                  <button
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      void retireAgent(agent)
+                    }}
+                    disabled={deletingAgentId === agent.id}
+                    className="lg-btn-ghost"
+                    style={{
+                      marginTop: 8,
+                      width: '100%',
+                      justifyContent: 'center',
+                      padding: '7px 10px',
+                      fontSize: 11,
+                      color: 'rgba(248,113,113,0.82)',
+                      borderColor: 'rgba(248,113,113,0.18)',
+                    }}
+                  >
+                    {deletingAgentId === agent.id ? 'Retiring...' : 'Retire agent'}
+                  </button>
                 </motion.div>
               ))}
             </AnimatePresence>

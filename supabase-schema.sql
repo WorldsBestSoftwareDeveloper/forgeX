@@ -21,9 +21,31 @@ create table if not exists agents (
   last_task       text not null default 'No tasks yet',
   success_rate    integer not null default 100,
   task_count      integer not null default 0,
+  treasury_wallet text,
+  autonomy_active boolean not null default false,
+  autonomy_expires_at timestamptz,
+  autonomy_signature text,
+  autonomy_message text,
+  autonomy_signer text,
+  treasury_sol numeric(18,9),
+  treasury_usdc numeric(18,6),
+  treasury_tx_count integer not null default 0,
+  zerion_wallet_name text,
   created_at      timestamptz not null default now()
 );
 create index if not exists agents_wallet_idx on agents(wallet_address);
+
+alter table agents
+  add column if not exists treasury_wallet text,
+  add column if not exists autonomy_active boolean not null default false,
+  add column if not exists autonomy_expires_at timestamptz,
+  add column if not exists autonomy_signature text,
+  add column if not exists autonomy_message text,
+  add column if not exists autonomy_signer text,
+  add column if not exists treasury_sol numeric(18,9),
+  add column if not exists treasury_usdc numeric(18,6),
+  add column if not exists treasury_tx_count integer not null default 0,
+  add column if not exists zerion_wallet_name text;
 
 -- ─── AGENT RUNS ──────────────────────────────────────────────────────────────
 create table if not exists agent_runs (
@@ -63,6 +85,60 @@ create table if not exists transactions (
 create index if not exists txs_wallet_idx  on transactions(wallet_address);
 create index if not exists txs_created_idx on transactions(created_at desc);
 
+-- TREASURY WALLETS
+create table if not exists treasury_wallets (
+  id                    text primary key,
+  agent_id              text not null references agents(id) on delete cascade,
+  public_key            text not null,
+  encrypted_private_key text not null,
+  created_at            timestamptz not null default now(),
+  unique(agent_id)
+);
+create index if not exists treasury_wallets_agent_idx on treasury_wallets(agent_id);
+
+-- ZERION MAINNET EXECUTION WALLETS
+create table if not exists zerion_execution_wallets (
+  id                    text primary key,
+  agent_id              text not null references agents(id) on delete cascade,
+  public_key            text not null,
+  wallet_name           text not null,
+  encrypted_private_key text not null,
+  network               text not null default 'solana-mainnet',
+  created_at            timestamptz not null default now(),
+  unique(agent_id)
+);
+create index if not exists zerion_execution_wallets_agent_idx on zerion_execution_wallets(agent_id);
+
+-- AUTONOMY SESSIONS
+create table if not exists autonomy_sessions (
+  id              text primary key,
+  agent_id        text not null references agents(id) on delete cascade,
+  expires_at      timestamptz not null,
+  spend_limit     numeric(12,6) not null,
+  allowed_tokens  text[] not null default array['SOL','USDC'],
+  allowed_actions text[] not null default array['gas-rebalance','provider-payment','policy-check','simulation'],
+  signer          text,
+  signed_message  text,
+  signature       text,
+  active          boolean not null default true,
+  created_at      timestamptz not null default now()
+);
+create index if not exists autonomy_sessions_agent_idx on autonomy_sessions(agent_id);
+
+-- TREASURY ACTIONS
+create table if not exists treasury_actions (
+  id           text primary key,
+  agent_id     text not null references agents(id) on delete cascade,
+  type         text not null,
+  token_in     text,
+  token_out    text,
+  amount       numeric(12,6) not null default 0,
+  tx_signature text,
+  created_at   timestamptz not null default now()
+);
+create index if not exists treasury_actions_agent_idx on treasury_actions(agent_id);
+create index if not exists treasury_actions_created_idx on treasury_actions(created_at desc);
+
 -- ─── ROW LEVEL SECURITY ───────────────────────────────────────────────────────
 -- Prevents any user from reading another user's data at the DB level.
 -- Uses wallet_address to identify users (no external auth service needed).
@@ -71,12 +147,20 @@ alter table users         enable row level security;
 alter table agents        enable row level security;
 alter table agent_runs    enable row level security;
 alter table transactions  enable row level security;
+alter table treasury_wallets   enable row level security;
+alter table zerion_execution_wallets enable row level security;
+alter table autonomy_sessions  enable row level security;
+alter table treasury_actions   enable row level security;
 
 -- Drop policies if re-running so we can recreate cleanly
 drop policy if exists "users_own"   on users;
 drop policy if exists "agents_own"  on agents;
 drop policy if exists "runs_own"    on agent_runs;
 drop policy if exists "txs_own"     on transactions;
+drop policy if exists "treasury_wallets_own"  on treasury_wallets;
+drop policy if exists "zerion_execution_wallets_own" on zerion_execution_wallets;
+drop policy if exists "autonomy_sessions_own" on autonomy_sessions;
+drop policy if exists "treasury_actions_own"  on treasury_actions;
 
 -- Users can only see/edit their own row
 create policy "users_own" on users
@@ -93,6 +177,18 @@ create policy "runs_own" on agent_runs
   for all using (true) with check (true);
 
 create policy "txs_own" on transactions
+  for all using (true) with check (true);
+
+create policy "treasury_wallets_own" on treasury_wallets
+  for all using (true) with check (true);
+
+create policy "zerion_execution_wallets_own" on zerion_execution_wallets
+  for all using (true) with check (true);
+
+create policy "autonomy_sessions_own" on autonomy_sessions
+  for all using (true) with check (true);
+
+create policy "treasury_actions_own" on treasury_actions
   for all using (true) with check (true);
 
 -- ─── SPEND CAP VIEW (optional, useful for monitoring) ─────────────────────────
